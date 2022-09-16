@@ -62,8 +62,16 @@ func (t CustomReadSeeker) Seek(offset int64, whence int) (int64, error) {
 
 	if offset == 0 && whence == io.SeekEnd {
 		return t.finalSize, nil
-	} else if offset == 0 && whence == io.SeekStart {
-		return 0, nil
+	} else if whence == io.SeekStart {
+		// we need to check that the file is already written far enough
+		stat, err := t.fileHandler.Stat()
+		if err != nil {
+			return 0, err
+		}
+		if stat.Size() < offset {
+			return 0, fmt.Errorf("error while trying to acces file: download not progressed far enough")
+		}
+		return t.fileHandler.Seek(offset, whence)
 	} else {
 		return 0, fmt.Errorf("not implemented")
 	}
