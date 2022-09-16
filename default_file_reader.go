@@ -3,20 +3,19 @@
 package main
 
 import (
-	"os"
+	//"io"
 	"log"
+	"os"
 )
 
 type DefaultFileReader struct {
-	filePath 		string
-	fileHandler 	*os.File
+	filePath    string
+	fileHandler *os.File
 }
 
-
-
-
 func (t DefaultFileReader) Read(p []byte) (int, error) {
-	//log.Printf("Trying to read from file at number of bytes %d", len(p))
+	//pos, _ := t.fileHandler.Seek(0, io.SeekCurrent)
+	//log.Printf("Trying to read from file number of bytes %d at position", len(p), pos)
 	return t.fileHandler.Read(p)
 }
 
