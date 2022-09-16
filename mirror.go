@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cavaliergopher/grab/v3"
 )
 
 var urlRegex *regexp.Regexp // to get the details of a package (arch, version etc)
@@ -18,11 +20,20 @@ const download_rate_limit = 1024 * 1000
 const CACHE_DIR = "cache"
 const REMOTE_REPO_URL = "http://127.0.0.1:8000/repo/copy"
 
+type downloadingFilesInfo struct {
+    mu       *sync.Mutex
+	fullSize int64
+	progress int64
+	modifyProgress	*sync.Mutex
+}
+
+
 // A mutex map for files currently being downloaded. It is used to prevent downloading the same file with concurrent requests
 // TODO: would maybe be more elegant with some sort of container?
 var (
-	downloadingFiles      = make(map[string]*sync.Mutex) // this allocates (make) a map which will map strings to *sync.Mutex (mutex-pointers)
+	downloadingFiles      = make(map[string]downloadingFilesInfo) // this allocates (make) a map which will map strings to *sync.Mutex (mutex-pointers)
 	downloadingFilesMutex sync.Mutex
+	// this stores info for files that are currently being downloaded
 )
 
 func main() {
@@ -37,7 +48,7 @@ func main() {
 		return
 	}
 
-	fmt.Printf("Starting server at port 8000\n")
+	fmt.Printf("Starting server at port 9000\n")
 	if error := http.ListenAndServe(":9000", nil); error != nil {
 		log.Fatal(error)
 	}
@@ -65,59 +76,47 @@ func handleRequest(w http.ResponseWriter, req *http.Request) error {
 			return err
 		}
 	}
-
-	// this is probably a bad way to do it, we'd also need to check whether we are currently already downloading the file
-	// but this is the pacoloco way
+	// requestFromServer tells us that we need to check for the file at the remote server, 
+	// as it isn't being downloaded currently and either may have changed or flat out doesn't exist in our cache
 	stat, err := os.Stat(filePath)
 	noFile := err != nil
-	requestFromServer := noFile || forceCheckAtServer(fileName)
+	//requestFromServer := noFile || forceCheckAtServer(fileName)
 
-	if requestFromServer {
-		// we first check whether the file is currently being downloaded
-		mutexKey := fileName
-		downloadingFilesMutex.Lock()                             // lock to indicate we will now access the map
-		newFileToDownloadMutex, ok := downloadingFiles[mutexKey] // check if the file is actually currently being downloaded
-		if !ok {                                                 // if not put it there; since this is a mutex only we can currently write to the thingy
-			// no result; create new mutex and put it in the map
-			newFileToDownloadMutex = &sync.Mutex{}
-			downloadingFiles[mutexKey] = newFileToDownloadMutex
-		}
-		downloadingFilesMutex.Unlock()
-		newFileToDownloadMutex.Lock() // shouldn't that block until a download is completed
-		defer func() {
-			// once we are done we can unlock and remove the new mutex from the map since it is, in fact, downloaded now (unless that got interrupted)
-			newFileToDownloadMutex.Unlock()
-			downloadingFilesMutex.Lock()
-			delete(downloadingFiles, mutexKey)
-			downloadingFilesMutex.Unlock()
-		}()
+	ifLater, _ := http.ParseTime(req.Header.Get("If-Modified-Since"))
+	if noFile {
+		// ignore If-Modified-Since and download file if it does not exist in the cache
+		ifLater = time.Time{}
+	} else if stat.ModTime().After(ifLater) {
+		ifLater = stat.ModTime()
+	}
 
-		// refresh the data in case if the file has been download while we were waiting for the mutex
-		// this actually makes a lot of sense I think? can't explain it atm tho.
-		stat, err = os.Stat(filePath)
-		noFile = err != nil
-		requestFromServer = noFile || forceCheckAtServer(fileName)
-	}
-	var served bool // this var will store whether we have served the file already and if not we will send the cached file later
-	if requestFromServer {
-		// not sure what this does exactly
-		ifLater, _ := http.ParseTime(req.Header.Get("If-Modified-Since"))
-		if noFile {
-			// ignore If-Modified-Since and download file if it does not exist in the cache
-			ifLater = time.Time{}
-		} else if stat.ModTime().After(ifLater) {
-			ifLater = stat.ModTime()
+	if noFile {
+		// if the file isn't in cache
+		startDownload(fileName, filePath, REMOTE_REPO_URL + "/" + fileName, ifLater)
+		log.Printf("File missing. Starting download")
+		// now send the data during download
+	} else if isBeingDownloaded(fileName) {
+		// the file is currently in download. thus, we need to piggyback off of that
+
+		downloadingFilesMutex.Lock()
+		defer downloadingFilesMutex.Unlock()
+		downloadingFile, ok := downloadingFiles[fileName]
+		if ok {
+			// file still in download
+			downloadingFile.modifyProgress.Lock()
+			log.Printf("File currently being downloaded(%v/%v). Piggy-Back off the existing download", downloadingFile.progress, downloadingFile.fullSize)
+			downloadingFile.modifyProgress.Unlock()
+		} else {
+			log.Printf("File download just got finished!")
 		}
-		// pacoloco would differentiate between repos here and save downloaded files into the database for prefetching. for this minimal example we don't need that
-		served, err = downloadFileAndSend(REMOTE_REPO_URL+"/"+fileName, filePath, ifLater, w)
-		if err != nil {
-			log.Println("Error with downloadFileAndSend:", err)
-		}
+	} else if forceCheckAtServer(fileName) {
+		// the file is here and not in download but we still need to check since it may have changed
+		log.Printf("File existing but may have changed on remote server. Downloading anyways")
+	} else {
+		// the file is here, not in download and hasn't changed on the server. just serve the cached file
+		log.Printf("Serve cached file")
 	}
-	// if we haven't already sent the file go do it now (and pacoloco afterwards updates the prefetch DB)
-	if !served {
-		err = sendCachedFile(w, req, fileName, filePath)
-	}
+
 	return err
 }
 
@@ -125,56 +124,27 @@ func handleRequest(w http.ResponseWriter, req *http.Request) error {
 // file and sends to `clientWriter` at the same time.
 // The function returns whether the function sent the data to client and error if one occurred.
 // This is the main thing that needs improving I think
-func downloadFileAndSend(url string, filePath string, ifModifiedSince time.Time, clientWriter http.ResponseWriter) (served bool, err error) {
-	var req *http.Request
+func downloadFileAndSend(url string, filePath string, ifModifiedSince time.Time, clientWriter http.ResponseWriter, request *http.Request) (served bool, err error) {
 	// something with timeouts here in the original source, but I don't think it matters too much
-	req, err = http.NewRequest("GET", url, nil)
-	if err != nil {
-		return
-	}
-
+	// I don't think we need to protect against double downloads here as 
+	client := grab.NewClient()
+	req, err := grab.NewRequest(filePath, url)
+	req.NoResume = true
+	// adding a few headers
 	if !ifModifiedSince.IsZero() {
-		req.Header.Set("If-Modified-Since", ifModifiedSince.UTC().Format(http.TimeFormat))
+		req.HTTPRequest.Header.Set("If-Modified-Since", ifModifiedSince.UTC().Format(http.TimeFormat))
 	}
-	// golang requests compression for all requests except HEAD
-	// some servers return compressed data without Content-Length header info
-	// disable compression as it useless for package data
-	req.Header.Add("Accept-Encoding", "identity")
+	// golang requests compression for all requests except HEAD. some servers return compressed data without Content-Length header info. disable compression as it useless for package data
+	req.HTTPRequest.Header.Add("Accept-Encoding", "identity")
+	resp := client.Do(req)
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	switch resp.StatusCode {
-	case http.StatusOK:
-		break
-	case http.StatusNotModified:
-		// either pacoloco or client has the latest version, no need to redownload it
-		return
-	default:
-		// for most dbs signatures are optional, be quiet if the signature is not found
-		// quiet := resp.StatusCode == http.StatusNotFound && strings.HasSuffix(url, ".db.sig")
-		err = fmt.Errorf("unable to download url %s, status code is %d", url, resp.StatusCode)
-		return
-	}
-
-	file, err := os.Create(filePath)
-	if err != nil {
-		return
-	}
-
+	log.Printf("did grab request, status code", resp.HTTPResponse.Status)
 	log.Printf("downloading %v", url)
-	clientWriter.Header().Set("Content-Length", resp.Header.Get("Content-Length"))
-	clientWriter.Header().Set("Content-Type", "application/octet-stream")
-	clientWriter.Header().Set("Last-Modified", resp.Header.Get("Last-Modified"))
 
-	// here the magic happens. this code writes the response body we just got directly to both the file on disk as
-	// well as the response header of the web server (however that works)
-	w := io.MultiWriter(file, clientWriter)
-	_, err = io.Copy(w, resp.Body)
-	_ = file.Close() // Close the file early to make sure the file modification time is set
+	dummyReader := strings.NewReader("This is a test message")
+	_, err = io.Copy(clientWriter, dummyReader)
+
+	// this isn't working
 	if err != nil {
 		// remove the cached file if download was not successful
 		log.Print(err)
@@ -183,7 +153,8 @@ func downloadFileAndSend(url string, filePath string, ifModifiedSince time.Time,
 	}
 	served = true
 
-	if lastModified := resp.Header.Get("Last-Modified"); lastModified != "" {
+	// modify the file such that it matches the actual change times 
+	if lastModified := resp.HTTPResponse.Header.Get("Last-Modified"); lastModified != "" {
 		lastModified, parseErr := http.ParseTime(lastModified)
 		err = parseErr
 		if err == nil {
@@ -196,18 +167,16 @@ func downloadFileAndSend(url string, filePath string, ifModifiedSince time.Time,
 	return
 }
 
-// I don't really understand this function
+// I think this function checks whether there was a file requested that can change on the remote mirror, i. e. package databases and such.
 func forceCheckAtServer(fileName string) bool {
 	// Suffixes for mutable files. We need to check the files modification date at the server.
 	forceCheckFiles := []string{".db", ".db.sig", ".files"}
 
 	for _, e := range forceCheckFiles {
 		if strings.HasSuffix(fileName, e) {
-			log.Println("ForceCheckAtServer returned true")
 			return true
 		}
 	}
-	log.Println("ForceCheckAtServer returned true")
 	return false
 }
 
@@ -227,4 +196,82 @@ func sendCachedFile(w http.ResponseWriter, req *http.Request, fileName string, f
 	log.Printf("serving cached file %v", filePath)
 	http.ServeContent(w, req, fileName, stat.ModTime(), file)
 	return nil
+}
+
+// checks whether a given file is being downloaded right now by referencing in the downloadingFiles map.
+func isBeingDownloaded(fileName string) bool {
+	downloadingFilesMutex.Lock()
+	defer downloadingFilesMutex.Unlock()
+	_, ok := downloadingFiles[fileName]
+	return ok
+}
+
+// this function starts a download and saves that fact for later usage
+func startDownload(fileName string, filePath string, url string, ifModifiedSince time.Time) {
+	// protect against double downloads: return if download is in progress or create new download entry
+	downloadingFilesMutex.Lock()                             
+	newFileToDownloadMutex, ok := downloadingFiles[fileName]
+	if ok {
+		return 	// a download is already in progress
+	}
+	newFileToDownloadMutex.mu = &sync.Mutex{}
+	newFileToDownloadMutex.modifyProgress = &sync.Mutex{}
+	newFileToDownloadMutex.mu.Lock()
+	newFileToDownloadMutex.modifyProgress.Lock() 					// lock this until we can set good values
+
+	defer func() {
+		// once we are done we can unlock and remove the new mutex from the map since it is, in fact, downloaded now (unless that got interrupted)
+		newFileToDownloadMutex.mu.Unlock()
+		downloadingFilesMutex.Lock()
+		delete(downloadingFiles, fileName)
+		downloadingFilesMutex.Unlock()
+	}()
+
+
+	// I don't think we need to protect against double downloads here as 
+	client := grab.NewClient()
+	req, _ := grab.NewRequest(filePath, url)
+	req.NoResume = true
+	// adding a few headers
+	if !ifModifiedSince.IsZero() {
+		req.HTTPRequest.Header.Set("If-Modified-Since", ifModifiedSince.UTC().Format(http.TimeFormat))
+	}
+	// golang requests compression for all requests except HEAD. some servers return compressed data without Content-Length header info. disable compression as it useless for package data
+	req.HTTPRequest.Header.Add("Accept-Encoding", "identity")
+	resp := client.Do(req)
+
+	newFileToDownloadMutex.fullSize = resp.Size()
+	newFileToDownloadMutex.modifyProgress.Unlock()
+	downloadingFiles[fileName] = newFileToDownloadMutex
+	downloadingFilesMutex.Unlock()
+
+	log.Printf("did grab request, status code", resp.HTTPResponse.Status)
+
+	// is this ticker necessary? is the time alright?
+	t := time.NewTicker(5 * time.Millisecond)
+	defer t.Stop()
+	Loop:
+	for {
+		select {
+		case <-t.C:
+			//	we update the download progress
+			//fmt.Printf("  transferred %v / %v bytes (%.2f%%)\n",
+			//	resp.BytesComplete(),
+			//	resp.Size,
+			//	100*resp.Progress())
+			// overwrite this thingy
+			downloadingFilesMutex.Lock()
+			newFileToDownloadMutex = downloadingFiles[fileName]
+			newFileToDownloadMutex.modifyProgress.Lock()
+			newFileToDownloadMutex.progress = resp.BytesComplete()
+			newFileToDownloadMutex.modifyProgress.Unlock()
+			downloadingFiles[fileName] = newFileToDownloadMutex
+			downloadingFilesMutex.Unlock()
+
+		case <-resp.Done:
+			// download is complete
+			break Loop
+		}
+	}
+	log.Printf("Download of file %v done!", fileName)
 }
