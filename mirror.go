@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,12 +22,11 @@ const CACHE_DIR = "cache"
 const REMOTE_REPO_URL = "http://127.0.0.1:8000/repo/copy"
 
 type downloadingFilesInfo struct {
-    mu       *sync.Mutex
-	fullSize int64
-	progress int64
-	modifyProgress	*sync.Mutex
+	mu             *sync.Mutex
+	fullSize       int64
+	progress       int64
+	modifyProgress *sync.Mutex
 }
-
 
 // A mutex map for files currently being downloaded. It is used to prevent downloading the same file with concurrent requests
 // TODO: would maybe be more elegant with some sort of container?
@@ -92,7 +92,7 @@ func handleRequest(w http.ResponseWriter, req *http.Request) error {
 
 	if noFile {
 		// if the file isn't in cache
-		startDownload(fileName, filePath, REMOTE_REPO_URL + "/" + fileName, ifLater)
+		startDownload(fileName, filePath, REMOTE_REPO_URL+"/"+fileName, ifLater)
 		log.Printf("File missing. Starting download")
 		// now send the data during download
 	} else if isBeingDownloaded(fileName) {
@@ -105,7 +105,15 @@ func handleRequest(w http.ResponseWriter, req *http.Request) error {
 			// file still in download
 			downloadingFile.modifyProgress.Lock()
 			log.Printf("File currently being downloaded(%v/%v). Piggy-Back off the existing download", downloadingFile.progress, downloadingFile.fullSize)
+
+			var file CustomReadSeeker
+			file.Init(downloadingFile.fullSize, filePath)
+			offset, _ := file.Seek(0, io.SeekEnd)
+			log.Printf(strconv.FormatInt(offset, 10))
+			log.Printf(strconv.FormatInt(file.finalSize, 10))
+			http.ServeContent(w, req, "", time.Now(), file)
 			downloadingFile.modifyProgress.Unlock()
+
 		} else {
 			log.Printf("File download just got finished!")
 		}
@@ -115,6 +123,9 @@ func handleRequest(w http.ResponseWriter, req *http.Request) error {
 	} else {
 		// the file is here, not in download and hasn't changed on the server. just serve the cached file
 		log.Printf("Serve cached file")
+		var file DefaultFileReader
+		file.Init(filePath)
+		http.ServeContent(w, req, "", time.Now(), file)
 	}
 
 	return err
@@ -126,7 +137,7 @@ func handleRequest(w http.ResponseWriter, req *http.Request) error {
 // This is the main thing that needs improving I think
 func downloadFileAndSend(url string, filePath string, ifModifiedSince time.Time, clientWriter http.ResponseWriter, request *http.Request) (served bool, err error) {
 	// something with timeouts here in the original source, but I don't think it matters too much
-	// I don't think we need to protect against double downloads here as 
+	// I don't think we need to protect against double downloads here as
 	client := grab.NewClient()
 	req, err := grab.NewRequest(filePath, url)
 	req.NoResume = true
@@ -209,7 +220,7 @@ func isBeingDownloaded(fileName string) bool {
 // this function starts a download and saves that fact for later usage
 func startDownload(fileName string, filePath string, url string, ifModifiedSince time.Time) {
 	// protect against double downloads: return if download is in progress or create new download entry
-	downloadingFilesMutex.Lock()                             
+	downloadingFilesMutex.Lock()
 	newFileToDownloadMutex, ok := downloadingFiles[fileName]
 	if ok {
 		return 	// a download is already in progress
@@ -241,6 +252,8 @@ func startDownload(fileName string, filePath string, url string, ifModifiedSince
 	resp := client.Do(req)
 
 	newFileToDownloadMutex.fullSize = resp.Size()
+	log.Printf(strconv.FormatInt(newFileToDownloadMutex.fullSize, 10))
+
 	newFileToDownloadMutex.modifyProgress.Unlock()
 	downloadingFiles[fileName] = newFileToDownloadMutex
 	downloadingFilesMutex.Unlock()
