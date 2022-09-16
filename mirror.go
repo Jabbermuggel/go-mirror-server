@@ -15,9 +15,8 @@ import (
 )
 
 var urlRegex *regexp.Regexp // to get the details of a package (arch, version etc)
-const download_rate_limit = 1024 * 1000
-const CACHE_DIR = "cache"
-const REMOTE_REPO_URL = "http://127.0.0.1:8000/repo/copy"
+const CacheDir = "cache"
+const RemoteRepoUrl = "http://127.0.0.1:8000/repo/copy"
 
 type FileInfo struct {
 	mu       *sync.Mutex // this is pretty redundant. we already lock the whole map, why add this?
@@ -63,9 +62,9 @@ func handleRequest(w http.ResponseWriter, req *http.Request) error {
 	fileName := matches[1]
 
 	// create cache directory if needed
-	filePath := filepath.Join(CACHE_DIR, fileName)
-	if _, err := os.Stat(CACHE_DIR); os.IsNotExist(err) {
-		if err := os.MkdirAll(CACHE_DIR, os.ModePerm); err != nil {
+	filePath := filepath.Join(CacheDir, fileName)
+	if _, err := os.Stat(CacheDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(CacheDir, os.ModePerm); err != nil {
 			return err
 		}
 	}
@@ -85,10 +84,24 @@ func handleRequest(w http.ResponseWriter, req *http.Request) error {
 
 	if noFile {
 		// if the file isn't in cache
-		startDownload(fileName, filePath, REMOTE_REPO_URL+"/"+fileName, ifLater)
-		log.Printf("File missing. Starting download")
-		dummyReader := strings.NewReader("This is a test message")
-		http.ServeContent(w, req, "", time.Now(), dummyReader)
+		startDownload(fileName, filePath, RemoteRepoUrl+"/"+fileName, ifLater)
+		log.Printf("File missing. Starting download and serving file")
+		// now basically the same as if the download was already running when we got here
+		filesLock.Lock()
+		downloadingFileInfo, ok := files[fileName]
+		if ok {
+			var file CustomReadSeeker
+			file.Init(downloadingFileInfo.fullSize, filePath)
+
+			// unlock the lock now early so that other threads won't get blocked during download
+			filesLock.Unlock()
+			http.ServeContent(w, req, "", time.Now(), file)
+			file.Close()
+
+		} else {
+			log.Printf("File download just got finished! We can serve the file normally now")
+			filesLock.Unlock()
+		}
 		return nil
 		// now send the data during download
 	} else if isBeingDownloaded(fileName) {
@@ -106,8 +119,6 @@ func handleRequest(w http.ResponseWriter, req *http.Request) error {
 			// unlock the lock now early so that other threads won't get blocked during download
 			filesLock.Unlock()
 			http.ServeContent(w, req, "", time.Now(), file)
-			log.Printf("Finished ServeContent-Call")
-
 			file.Close()
 
 		} else {
@@ -120,10 +131,7 @@ func handleRequest(w http.ResponseWriter, req *http.Request) error {
 	} else {
 		// the file is here, not in download and hasn't changed on the server. just serve the cached file
 		log.Printf("Serve cached file")
-		var file DefaultFileReader
-		file.Init(filePath)
-		http.ServeContent(w, req, "", time.Now(), file)
-		log.Printf("Done Serving cached file")
+		sendCachedFile(w, req, fileName, filePath)
 	}
 
 	return err
